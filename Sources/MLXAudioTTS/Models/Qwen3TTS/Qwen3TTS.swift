@@ -58,30 +58,25 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         language: String?,
         generationParameters: GenerateParameters
     ) async throws -> MLXArray {
-        guard speechTokenizer != nil else {
-            throw AudioGenerationError.modelNotInitialized("Speech tokenizer not loaded")
-        }
-        guard tokenizer != nil else {
-            throw AudioGenerationError.modelNotInitialized("Text tokenizer not loaded")
-        }
+        try requireGenerationComponents()
+        let settings = resolveVoiceDesignGenerationSettings(
+            language: language,
+            generationParameters: generationParameters
+        )
 
-        // VoiceDesign: voice parameter is the instruct (voice description)
-        let instruct = voice
-
-        let audio = generateVoiceDesign(
+        return try generateVoiceDesign(
             text: text,
-            instruct: instruct,
-            language: language ?? "auto",
+            instruct: voice,
+            language: settings.language,
             refAudio: refAudio,
             refText: refText,
-            temperature: generationParameters.temperature,
-            topK: 50,
-            topP: generationParameters.topP,
-            repetitionPenalty: generationParameters.repetitionPenalty ?? 1.05,
-            minP: 0.0,
-            maxTokens: generationParameters.maxTokens ?? 4096
+            temperature: settings.temperature,
+            topK: settings.topK,
+            topP: settings.topP,
+            repetitionPenalty: settings.repetitionPenalty,
+            minP: settings.minP,
+            maxTokens: settings.maxTokens
         )
-        return audio
     }
 
     public func generateStream(
@@ -112,54 +107,101 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         generationParameters: GenerateParameters,
         streamingInterval: Double
     ) -> AsyncThrowingStream<AudioGeneration, Error> {
-        let (stream, continuation) = AsyncThrowingStream<AudioGeneration, Error>.makeStream()
-        Task { @Sendable [weak self] in
-            guard let self else { return }
-            do {
-                guard speechTokenizer != nil else {
-                    throw AudioGenerationError.modelNotInitialized("Speech tokenizer not loaded")
-                }
-                guard tokenizer != nil else {
-                    throw AudioGenerationError.modelNotInitialized("Text tokenizer not loaded")
-                }
-
-                // VoiceDesign: voice parameter is the instruct (voice description)
-                let instruct = voice
-                let lang = language ?? "auto"
-                let temp = generationParameters.temperature
-                let topP = generationParameters.topP
-                let repPenalty = generationParameters.repetitionPenalty ?? 1.05
-                let maxTokens = generationParameters.maxTokens ?? 4096
-
-                _ = generateVoiceDesign(
-                    text: text,
-                    instruct: instruct,
-                    language: lang,
-                    refAudio: refAudio,
-                    refText: refText,
-                    temperature: temp,
-                    topK: 50,
-                    topP: topP,
-                    repetitionPenalty: repPenalty,
-                    minP: 0.0,
-                    maxTokens: maxTokens,
-                    streamingInterval: streamingInterval,
-                    onToken: { tokenId in
-                        continuation.yield(.token(tokenId))
-                    },
-                    onInfo: { info in
-                        continuation.yield(.info(info))
-                    },
-                    onAudioChunk: { chunk in
-                        continuation.yield(.audio(chunk))
-                    }
-                )
-                continuation.finish()
-            } catch {
-                continuation.finish(throwing: error)
-            }
+        let settings = resolveVoiceDesignGenerationSettings(
+            language: language,
+            generationParameters: generationParameters
+        )
+        return makeGenerationStream { model, onToken, onInfo, onAudioChunk in
+            _ = try model.generateVoiceDesign(
+                text: text,
+                instruct: voice,
+                language: settings.language,
+                refAudio: refAudio,
+                refText: refText,
+                temperature: settings.temperature,
+                topK: settings.topK,
+                topP: settings.topP,
+                repetitionPenalty: settings.repetitionPenalty,
+                minP: settings.minP,
+                maxTokens: settings.maxTokens,
+                streamingInterval: streamingInterval,
+                onToken: onToken,
+                onInfo: onInfo,
+                onAudioChunk: onAudioChunk
+            )
         }
-        return stream
+    }
+
+    public func generate(
+        text: String,
+        conditioning: Qwen3TTSReferenceConditioning,
+        generationParameters: GenerateParameters
+    ) async throws -> MLXArray {
+        try requireGenerationComponents()
+        let settings = resolveVoiceDesignGenerationSettings(
+            language: conditioning.resolvedLanguage,
+            generationParameters: generationParameters
+        )
+
+        return try generateVoiceDesign(
+            text: text,
+            instruct: nil,
+            language: settings.language,
+            conditioning: conditioning,
+            refAudio: nil,
+            refText: nil,
+            temperature: settings.temperature,
+            topK: settings.topK,
+            topP: settings.topP,
+            repetitionPenalty: settings.repetitionPenalty,
+            minP: settings.minP,
+            maxTokens: settings.maxTokens
+        )
+    }
+
+    public func generateStream(
+        text: String,
+        conditioning: Qwen3TTSReferenceConditioning,
+        generationParameters: GenerateParameters
+    ) -> AsyncThrowingStream<AudioGeneration, Error> {
+        generateStream(
+            text: text,
+            conditioning: conditioning,
+            generationParameters: generationParameters,
+            streamingInterval: 2.0
+        )
+    }
+
+    public func generateStream(
+        text: String,
+        conditioning: Qwen3TTSReferenceConditioning,
+        generationParameters: GenerateParameters,
+        streamingInterval: Double
+    ) -> AsyncThrowingStream<AudioGeneration, Error> {
+        let settings = resolveVoiceDesignGenerationSettings(
+            language: conditioning.resolvedLanguage,
+            generationParameters: generationParameters
+        )
+        return makeGenerationStream { model, onToken, onInfo, onAudioChunk in
+            _ = try model.generateVoiceDesign(
+                text: text,
+                instruct: nil,
+                language: settings.language,
+                conditioning: conditioning,
+                refAudio: nil,
+                refText: nil,
+                temperature: settings.temperature,
+                topK: settings.topK,
+                topP: settings.topP,
+                repetitionPenalty: settings.repetitionPenalty,
+                minP: settings.minP,
+                maxTokens: settings.maxTokens,
+                streamingInterval: streamingInterval,
+                onToken: onToken,
+                onInfo: onInfo,
+                onAudioChunk: onAudioChunk
+            )
+        }
     }
 
     // MARK: - Decode chunk helper
@@ -265,6 +307,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         text: String,
         instruct: String?,
         language: String,
+        conditioning: Qwen3TTSReferenceConditioning? = nil,
         refAudio: MLXArray?,
         refText: String?,
         temperature: Float,
@@ -277,9 +320,11 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         onToken: ((Int) -> Void)? = nil,
         onInfo: ((AudioGenerationInfo) -> Void)? = nil,
         onAudioChunk: ((MLXArray) -> Void)? = nil
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         guard let speechTokenizer, let tokenizer else {
-            return MLXArray.zeros([1])
+            throw AudioGenerationError.modelNotInitialized(
+                "Qwen3TTS generateVoiceDesign requires both the speech tokenizer and the text tokenizer to be loaded."
+            )
         }
 
         let talkerConfig = config.talkerConfig!
@@ -290,10 +335,19 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let ttsPadEmbed: MLXArray
         let refCodes: MLXArray?
 
-        if let refAudio,
+        if let conditioning {
+            let prepared = try prepareICLGenerationInputs(
+                text: text,
+                conditioning: conditioning
+            )
+            inputEmbedsInit = prepared.0
+            trailingTextHidden = prepared.1
+            ttsPadEmbed = prepared.2
+            refCodes = prepared.3
+        } else if let refAudio,
            let refText,
            speechTokenizer.hasEncoder {
-            let prepared = prepareICLGenerationInputs(
+            let prepared = try prepareICLGenerationInputs(
                 text: text,
                 refAudio: refAudio,
                 refText: refText,
@@ -509,27 +563,158 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         return audio
     }
 
-    // MARK: - Prepare generation inputs
+    // MARK: - Reference conditioning
+
+    public func prepareReferenceConditioning(
+        refAudio: MLXArray,
+        refText: String,
+        language: String?
+    ) throws -> Qwen3TTSReferenceConditioning {
+        try prepareReferenceConditioning(
+            refAudio: refAudio,
+            refText: refText,
+            speakerEmbedding: nil,
+            language: language ?? "auto"
+        )
+    }
+
+    private struct VoiceDesignGenerationSettings {
+        let language: String
+        let temperature: Float
+        let topK: Int
+        let topP: Float
+        let repetitionPenalty: Float
+        let minP: Float
+        let maxTokens: Int
+    }
+
+    public struct Qwen3TTSReferenceConditioning: @unchecked Sendable {
+        public let speakerEmbedding: MLXArray?
+        public let referenceSpeechCodes: MLXArray
+        public let referenceTextTokenIDs: MLXArray
+        public let resolvedLanguage: String
+        public let codecLanguageID: Int?
+    }
+
+    private func requireGenerationComponents() throws {
+        guard speechTokenizer != nil else {
+            throw AudioGenerationError.modelNotInitialized("Speech tokenizer not loaded")
+        }
+        guard tokenizer != nil else {
+            throw AudioGenerationError.modelNotInitialized("Text tokenizer not loaded")
+        }
+    }
+
+    private func resolveVoiceDesignGenerationSettings(
+        language: String?,
+        generationParameters: GenerateParameters
+    ) -> VoiceDesignGenerationSettings {
+        VoiceDesignGenerationSettings(
+            language: language ?? "auto",
+            temperature: generationParameters.temperature,
+            topK: 50,
+            topP: generationParameters.topP,
+            repetitionPenalty: generationParameters.repetitionPenalty ?? 1.05,
+            minP: 0.0,
+            maxTokens: generationParameters.maxTokens ?? 4096
+        )
+    }
+
+    private func makeGenerationStream(
+        _ body: @escaping @Sendable (
+            Qwen3TTSModel,
+            @escaping (Int) -> Void,
+            @escaping (AudioGenerationInfo) -> Void,
+            @escaping (MLXArray) -> Void
+        ) throws -> Void
+    ) -> AsyncThrowingStream<AudioGeneration, Error> {
+        let (stream, continuation) = AsyncThrowingStream<AudioGeneration, Error>.makeStream()
+        Task { @Sendable [weak self] in
+            guard let self else { return }
+            do {
+                try requireGenerationComponents()
+                try body(
+                    self,
+                    { tokenId in continuation.yield(.token(tokenId)) },
+                    { info in continuation.yield(.info(info)) },
+                    { chunk in continuation.yield(.audio(chunk)) }
+                )
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+        return stream
+    }
 
     func prepareICLGenerationInputs(
         text: String,
         refAudio: MLXArray,
         refText: String,
         language: String
-    ) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
-        guard let tokenizer, let talkerConfig = config.talkerConfig else {
-            fatalError("Tokenizer/config not loaded")
+    ) throws -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+        let conditioning = try prepareReferenceConditioning(
+            refAudio: refAudio,
+            refText: refText,
+            speakerEmbedding: nil,
+            language: language
+        )
+        return try prepareICLGenerationInputs(text: text, conditioning: conditioning)
+    }
+
+    func prepareReferenceConditioning(
+        refAudio: MLXArray,
+        refText: String,
+        speakerEmbedding: MLXArray?,
+        language: String
+    ) throws -> Qwen3TTSReferenceConditioning {
+        guard let tokenizer, let talkerConfig = config.talkerConfig, let speechTokenizer else {
+            throw AudioGenerationError.modelNotInitialized(
+                "Qwen3TTS reference conditioning requires the text tokenizer, talker config, and speech tokenizer to be loaded."
+            )
+        }
+        guard speechTokenizer.hasEncoder else {
+            throw AudioGenerationError.invalidInput(
+                "Qwen3TTS reference conditioning requires a speech tokenizer encoder, but this checkpoint does not provide one."
+            )
         }
 
         let refContext = referenceAudioContext(for: refAudio)
 
-        // Reference text and target text tokenization
+        let resolvedLanguage = language.lowercased() == "auto" ? "auto" : language.lowercased()
+
+        // Reference text tokenization
         let refChatText = "<|im_start|>assistant\n\(refText)<|im_end|>\n"
         let refIds = MLXArray(tokenizer.encode(text: refChatText).map { Int32($0) }).reshaped(1, -1)
         let refCount = refIds.dim(1)
         let refStart = min(3, refCount)
         let refEnd = max(refStart, refCount - 2)
         let refTextIds = refIds[0..., refStart ..< refEnd]
+
+        // Language ID
+        var languageId: Int?
+        if resolvedLanguage != "auto", let langMap = talkerConfig.codecLanguageId {
+            languageId = langMap[resolvedLanguage]
+        }
+
+        return Qwen3TTSReferenceConditioning(
+            speakerEmbedding: speakerEmbedding ?? refContext.speakerEmbedding,
+            referenceSpeechCodes: refContext.refCodes,
+            referenceTextTokenIDs: refTextIds,
+            resolvedLanguage: resolvedLanguage,
+            codecLanguageID: languageId
+        )
+    }
+
+    func prepareICLGenerationInputs(
+        text: String,
+        conditioning: Qwen3TTSReferenceConditioning
+    ) throws -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+        guard let tokenizer, let talkerConfig = config.talkerConfig else {
+            throw AudioGenerationError.modelNotInitialized(
+                "Qwen3TTS request assembly requires the text tokenizer and talker config to be loaded."
+            )
+        }
 
         let targetChatText = "<|im_start|>assistant\n\(text)<|im_end|>\n<|im_start|>assistant\n"
         let targetIds = MLXArray(tokenizer.encode(text: targetChatText).map { Int32($0) }).reshaped(1, -1)
@@ -538,9 +723,6 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let targetEnd = max(targetStart, targetCount - 5)
         let targetTextIds = targetIds[0..., targetStart ..< targetEnd]
 
-        let refCodes = refContext.refCodes // [1, num_code_groups, ref_time]
-
-        // TTS special tokens
         let ttsTokens = MLXArray(
             [Int32(config.ttsBosTokenId), Int32(config.ttsEosTokenId), Int32(config.ttsPadTokenId)]
         ).reshaped(1, 3)
@@ -549,16 +731,17 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let ttsEosEmbed = ttsEmbeds[0..., 1 ..< 2, 0...]
         let ttsPadEmbed = ttsEmbeds[0..., 2 ..< 3, 0...]
 
-        // Build text embeddings for ref+target
-        let combinedTextIds = concatenated([refTextIds, targetTextIds], axis: 1)
+        let combinedTextIds = concatenated([conditioning.referenceTextTokenIDs, targetTextIds], axis: 1)
         var textEmbed = talker.textProjection(talker.getTextEmbeddings()(combinedTextIds))
         textEmbed = concatenated([textEmbed, ttsEosEmbed], axis: 1)
         let textLen = textEmbed.dim(1)
 
-        let codecEmbedIcl = refContext.codecEmbedIcl
+        let refCodes = conditioning.referenceSpeechCodes
+        let codecEmbedIcl = codecEmbedIcl(from: refCodes, talkerConfig: talkerConfig)
 
-        // Non-streaming overlay of text and codec contexts
-        let codecPadEmbed = talker.getInputEmbeddings()(MLXArray([Int32(talkerConfig.codecPadId)]).reshaped(1, 1))
+        let codecPadEmbed = talker.getInputEmbeddings()(
+            MLXArray([Int32(talkerConfig.codecPadId)]).reshaped(1, 1)
+        )
         let textWithCodecPad = textEmbed + broadcast(
             codecPadEmbed,
             to: [1, textLen, codecPadEmbed.dim(-1)]
@@ -571,13 +754,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let iclInputEmbed = concatenated([textWithCodecPad, codecWithTextPad], axis: 1)
         let trailingTextHidden = ttsPadEmbed
 
-        // Language ID
-        var languageId: Int?
-        if language.lowercased() != "auto", let langMap = talkerConfig.codecLanguageId {
-            languageId = langMap[language.lowercased()]
-        }
-
-        let codecPrefill: [Int32] = if let langId = languageId {
+        let codecPrefill: [Int32] = if let langId = conditioning.codecLanguageID {
             [
                 Int32(talkerConfig.codecThinkId),
                 Int32(talkerConfig.codecThinkBosId),
@@ -596,23 +773,20 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let codecPrefixSuffix = talker.getInputEmbeddings()(
             MLXArray([Int32(talkerConfig.codecPadId), Int32(talkerConfig.codecBosId)]).reshaped(1, 2)
         )
-        if let speakerEmbedding = refContext.speakerEmbedding {
+        if let speakerEmbedding = conditioning.speakerEmbedding {
             let speakerEmbed = speakerEmbedding.reshaped(1, 1, -1)
             codecPrefixEmbed = concatenated([codecPrefixEmbed, speakerEmbed, codecPrefixSuffix], axis: 1)
         } else {
             codecPrefixEmbed = concatenated([codecPrefixEmbed, codecPrefixSuffix], axis: 1)
         }
 
-        // Role embedding
         let roleEmbed = talker.textProjection(talker.getTextEmbeddings()(targetIds[0..., 0 ..< 3]))
 
-        // Build prefix: text side overlayed with codec prefix
         let padCount = codecPrefixEmbed.dim(1) - 2
         let padEmbeds = broadcast(ttsPadEmbed, to: [1, padCount, ttsPadEmbed.dim(-1)])
         var combinedPrefix = concatenated([padEmbeds, ttsBosEmbed], axis: 1)
         combinedPrefix = combinedPrefix + codecPrefixEmbed[0..., 0 ..< (codecPrefixEmbed.dim(1) - 1), 0...]
 
-        // Full input embedding
         let inputEmbeds = concatenated([roleEmbed, combinedPrefix, iclInputEmbed], axis: 1)
 
         return (inputEmbeds, trailingTextHidden, ttsPadEmbed, refCodes)
