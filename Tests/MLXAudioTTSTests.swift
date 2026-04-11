@@ -19,6 +19,7 @@ import Testing
 import MLX
 import Metal
 import MLXLMCommon
+import Tokenizers
 import Foundation
 
 private let metalAvailable: Bool = {
@@ -42,6 +43,186 @@ private func loadTTSNetworkFixture(sampleRate: Int, maxSamples: Int) throws -> M
     let (_, audio) = try loadAudioArray(from: audioURL, sampleRate: sampleRate)
     let sampleCount = min(audio.shape[0], maxSamples)
     return audio[0..<sampleCount]
+}
+
+private func writeTestFile(_ url: URL, contents: String) throws {
+    let data = try #require(contents.data(using: .utf8))
+    try data.write(to: url)
+}
+
+private func makeTemporaryArtifactDirectory(prefix: String) throws -> URL {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    return directory
+}
+
+private func cleanupTemporaryArtifactDirectory(_ directory: URL) {
+    try? FileManager.default.removeItem(at: directory)
+}
+
+private func makeTinyQwenTokenizerDirectory() throws -> URL {
+    let directory = try makeTemporaryArtifactDirectory(prefix: "tiny-qwen3-tokenizer")
+
+    let tokenizerConfig = """
+    {
+      "tokenizer_class": "GPT2Tokenizer",
+      "bos_token": "<bos>",
+      "eos_token": "<eos>",
+      "unk_token": "<unk>",
+      "pad_token": "<pad>",
+      "model_max_length": 128,
+      "do_lower_case": false
+    }
+    """
+
+    let tokenizerData = """
+    {
+      "version": "1.0",
+      "truncation": null,
+      "padding": null,
+      "added_tokens": [
+        { "id": 0, "content": "<bos>", "special": true },
+        { "id": 1, "content": "<pad>", "special": true },
+        { "id": 2, "content": "<eos>", "special": true },
+        { "id": 3, "content": "<unk>", "special": true },
+        { "id": 4, "content": "<|im_start|>", "special": true },
+        { "id": 5, "content": "<|im_end|>", "special": true }
+      ],
+      "model": {
+        "type": "BPE",
+        "vocab": {
+          "<bos>": 0,
+          "<pad>": 1,
+          "<eos>": 2,
+          "<unk>": 3,
+          "<|im_start|>": 4,
+          "<|im_end|>": 5,
+          "assistant": 6,
+          "user": 7,
+          "one": 8,
+          "two": 9,
+          "three": 10,
+          "four": 11,
+          "five": 12,
+          "target": 13,
+          "voice": 14,
+          "prompt": 15,
+          "sample": 16,
+          "english": 17
+        },
+        "merges": [],
+        "continuing_subword_prefix": "",
+        "end_of_word_suffix": "",
+        "unk_token": "<unk>"
+      },
+      "normalizer": {
+        "type": "Lowercase"
+      },
+      "pre_tokenizer": {
+        "type": "Whitespace"
+      }
+    }
+    """
+
+    try writeTestFile(directory.appendingPathComponent("tokenizer_config.json"), contents: tokenizerConfig)
+    try writeTestFile(directory.appendingPathComponent("tokenizer.json"), contents: tokenizerData)
+    return directory
+}
+
+private func makeTinyQwen3TTSModel(
+    ttsModelType: String,
+    includeSpeechEncoder: Bool,
+    speakerIDEntries: String = "",
+    dialectEntries: String = ""
+) async throws -> (model: Qwen3TTSModel, tokenizerDirectory: URL) {
+    let tokenizerDirectory = try makeTinyQwenTokenizerDirectory()
+    let encoderConfigJSON = includeSpeechEncoder ? #""encoder_config": {},"# : ""
+    let spkIdJSON = speakerIDEntries.isEmpty ? "" : #""spk_id": {"# + speakerIDEntries + "},"
+    let spkDialectJSON = dialectEntries.isEmpty ? "" : #""spk_is_dialect": {"# + dialectEntries + "},"
+    let configJSON = """
+    {
+      "model_type": "qwen3_tts",
+      "tts_model_type": "\(ttsModelType)",
+      "tts_model_size": "tiny",
+      "tokenizer_type": "qwen3_tts_tokenizer_12hz",
+      "im_start_token_id": 4,
+      "im_end_token_id": 5,
+      "tts_pad_token_id": 21,
+      "tts_bos_token_id": 22,
+      "tts_eos_token_id": 23,
+      "sample_rate": 24000,
+      "talker_config": {
+        "vocab_size": 3072,
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 4,
+        "head_dim": 4,
+        "max_position_embeddings": 128,
+        "num_code_groups": 2,
+        "text_hidden_size": 16,
+        "text_vocab_size": 64,
+        "codec_eos_token_id": 3050,
+        "codec_think_id": 3051,
+        "codec_nothink_id": 3052,
+        "codec_think_bos_id": 3053,
+        "codec_think_eos_id": 3054,
+        "codec_pad_id": 3055,
+        "codec_bos_id": 3056,
+        "codec_language_id": {
+          "english": 3057
+        },
+        \(spkIdJSON)
+        \(spkDialectJSON)
+        "code_predictor_config": {
+          "vocab_size": 2048,
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 1,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 4,
+          "head_dim": 4,
+          "max_position_embeddings": 128,
+          "num_code_groups": 2
+        }
+      },
+      "tokenizer_config": {
+        "encoder_valid_num_quantizers": 2,
+        \(encoderConfigJSON)
+        "decoder_config": {}
+      }
+    }
+    """
+
+    let configData = Data(configJSON.utf8)
+    let config = try JSONDecoder().decode(Qwen3TTSModelConfig.self, from: configData)
+    let model = Qwen3TTSModel(config: config)
+    model.tokenizer = try await AutoTokenizer.from(modelFolder: tokenizerDirectory)
+    model.speechTokenizer = Qwen3TTSSpeechTokenizer(config: try #require(config.tokenizerConfig))
+    return (model, tokenizerDirectory)
+}
+
+private func collectQwen3TTSStream(
+    _ stream: AsyncThrowingStream<AudioGeneration, Error>
+) async throws -> (tokenCount: Int, infoCount: Int, lastAudio: MLXArray?) {
+    var tokenCount = 0
+    var infoCount = 0
+    var lastAudio: MLXArray?
+
+    for try await event in stream {
+        switch event {
+        case .token:
+            tokenCount += 1
+        case .info:
+            infoCount += 1
+        case .audio(let audio):
+            lastAudio = audio
+        }
+    }
+
+    return (tokenCount, infoCount, lastAudio)
 }
 
 private struct FakeFishTokenizer: FishSpeechTokenizing {
@@ -111,6 +292,161 @@ private func makeTinyFishSpeechConfig() -> FishSpeechConfig {
 
 
 // MARK: - Text Cleaning Unit Tests
+
+@Suite("Qwen3TTS")
+struct Qwen3TTSTests {
+
+    @Test func prepareReferenceConditioningBuildsReusableReferenceState() async throws {
+        let fixture = try await makeTinyQwen3TTSModel(
+            ttsModelType: "voice_design",
+            includeSpeechEncoder: true
+        )
+        defer { cleanupTemporaryArtifactDirectory(fixture.tokenizerDirectory) }
+
+        let refAudio = try loadTTSNetworkFixture(sampleRate: 24_000, maxSamples: 24_000)
+        let conditioning = try fixture.model.prepareReferenceConditioning(
+            refAudio: refAudio,
+            refText: "one two three four five one two three four five",
+            language: "English"
+        )
+
+        #expect(conditioning.speakerEmbedding == nil)
+        #expect(conditioning.referenceSpeechCodes.ndim == 3)
+        #expect(conditioning.referenceSpeechCodes.dim(0) == 1)
+        #expect(conditioning.referenceSpeechCodes.dim(1) == 2)
+        #expect(conditioning.referenceSpeechCodes.dim(2) > 0)
+        #expect(conditioning.referenceTextTokenIDs.ndim == 2)
+        #expect(conditioning.referenceTextTokenIDs.dim(1) > 0)
+        #expect(conditioning.resolvedLanguage == "english")
+        #expect(conditioning.codecLanguageID == 3057)
+    }
+
+    @Test func generateFromPreparedConditioningSupportsDirectAndStreamingCalls() async throws {
+        let fixture = try await makeTinyQwen3TTSModel(
+            ttsModelType: "voice_design",
+            includeSpeechEncoder: true
+        )
+        defer { cleanupTemporaryArtifactDirectory(fixture.tokenizerDirectory) }
+
+        let refAudio = try loadTTSNetworkFixture(sampleRate: 24_000, maxSamples: 24_000)
+        let conditioning = try fixture.model.prepareReferenceConditioning(
+            refAudio: refAudio,
+            refText: "one two three four five one two three four five",
+            language: "English"
+        )
+        let parameters = GenerateParameters(
+            maxTokens: 2,
+            temperature: 0.7,
+            topP: 0.95,
+            repetitionPenalty: 1.0
+        )
+
+        MLXRandom.seed(0)
+        let audio = try await fixture.model.generate(
+            text: "target voice prompt one two three four five",
+            conditioning: conditioning,
+            generationParameters: parameters
+        )
+        #expect(audio.ndim == 1)
+        #expect(audio.shape[0] > 0)
+
+        MLXRandom.seed(0)
+        let streamResult = try await collectQwen3TTSStream(
+            fixture.model.generateStream(
+                text: "target voice prompt one two three four five",
+                conditioning: conditioning,
+                generationParameters: parameters,
+                streamingInterval: 0.05
+            )
+        )
+        #expect(streamResult.tokenCount > 0)
+        #expect(streamResult.infoCount == 1)
+        #expect(streamResult.lastAudio != nil)
+        #expect(streamResult.lastAudio?.ndim == 1)
+    }
+
+    @Test func rawReferenceAPIsStillWorkThroughTheCompatibilityWrapper() async throws {
+        let fixture = try await makeTinyQwen3TTSModel(
+            ttsModelType: "voice_design",
+            includeSpeechEncoder: true
+        )
+        defer { cleanupTemporaryArtifactDirectory(fixture.tokenizerDirectory) }
+
+        let refAudio = try loadTTSNetworkFixture(sampleRate: 24_000, maxSamples: 24_000)
+        let parameters = GenerateParameters(
+            maxTokens: 2,
+            temperature: 0.7,
+            topP: 0.95,
+            repetitionPenalty: 1.0
+        )
+
+        MLXRandom.seed(0)
+        let rawAudio = try await fixture.model.generate(
+            text: "target voice prompt one two three four five",
+            voice: nil,
+            refAudio: refAudio,
+            refText: "one two three four five one two three four five",
+            language: "English",
+            generationParameters: parameters
+        )
+        #expect(rawAudio.ndim == 1)
+        #expect(rawAudio.shape[0] > 0)
+
+        MLXRandom.seed(0)
+        let streamResult = try await collectQwen3TTSStream(
+            fixture.model.generateStream(
+                text: "target voice prompt one two three four five",
+                voice: nil,
+                refAudio: refAudio,
+                refText: "one two three four five one two three four five",
+                language: "English",
+                generationParameters: parameters,
+                streamingInterval: 0.05
+            )
+        )
+        #expect(streamResult.tokenCount > 0)
+        #expect(streamResult.infoCount == 1)
+        #expect(streamResult.lastAudio != nil)
+        #expect(streamResult.lastAudio?.ndim == 1)
+    }
+
+    @Test func customVoiceRemainsSeparateFromReferenceConditioning() async throws {
+        let fixture = try await makeTinyQwen3TTSModel(
+            ttsModelType: "custom_voice",
+            includeSpeechEncoder: false,
+            speakerIDEntries: #""ryan": 100"#,
+            dialectEntries: #""ryan": false"#
+        )
+        defer { cleanupTemporaryArtifactDirectory(fixture.tokenizerDirectory) }
+
+        let parameters = GenerateParameters(
+            maxTokens: 2,
+            temperature: 0.7,
+            topP: 0.95,
+            repetitionPenalty: 1.0
+        )
+
+        let audio = try await fixture.model.generate(
+            text: "target voice prompt one two three four five",
+            voice: "ryan",
+            refAudio: nil,
+            refText: nil,
+            language: "English",
+            generationParameters: parameters
+        )
+        #expect(audio.ndim == 1)
+        #expect(audio.shape[0] > 0)
+
+        let refAudio = try loadTTSNetworkFixture(sampleRate: 24_000, maxSamples: 24_000)
+        #expect(throws: AudioGenerationError.self) {
+            try fixture.model.prepareReferenceConditioning(
+                refAudio: refAudio,
+                refText: "one two three four five one two three four five",
+                language: "English"
+            )
+        }
+    }
+}
 
 struct SopranoTextCleaningTests {
 
