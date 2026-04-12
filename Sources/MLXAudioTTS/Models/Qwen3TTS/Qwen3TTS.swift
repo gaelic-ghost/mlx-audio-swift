@@ -594,6 +594,20 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         public let referenceTextTokenIDs: MLXArray
         public let resolvedLanguage: String
         public let codecLanguageID: Int?
+
+        public init(
+            speakerEmbedding: MLXArray?,
+            referenceSpeechCodes: MLXArray,
+            referenceTextTokenIDs: MLXArray,
+            resolvedLanguage: String,
+            codecLanguageID: Int?
+        ) {
+            self.speakerEmbedding = speakerEmbedding
+            self.referenceSpeechCodes = referenceSpeechCodes
+            self.referenceTextTokenIDs = referenceTextTokenIDs
+            self.resolvedLanguage = resolvedLanguage
+            self.codecLanguageID = codecLanguageID
+        }
     }
 
     private func requireGenerationComponents() throws {
