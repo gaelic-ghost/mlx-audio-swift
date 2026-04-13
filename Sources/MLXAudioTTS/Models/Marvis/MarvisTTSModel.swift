@@ -206,7 +206,10 @@ public extension MarvisTTSModel {
         }
         
         let parameters = ModuleParameters.unflattened(weights)
-        try model.update(parameters: parameters, verify: .all)
+        try model.update(
+            parameters: parameters,
+            verify: [.noUnusedKeys, .shapeMismatch]
+        )
         
         eval(model)
         return model
