@@ -17,6 +17,7 @@
 
 import Testing
 import MLX
+import MLXNN
 import Metal
 import MLXLMCommon
 import Tokenizers
@@ -445,6 +446,22 @@ struct Qwen3TTSTests {
                 language: "English"
             )
         }
+    }
+}
+
+@Suite("Marvis TTS")
+struct MarvisTTSTests {
+
+    @Test func ropeRuntimeCachesStayOutOfStrictVerification() throws {
+        let rope = CSMLlama3ScaledRoPE(dims: 8)
+        let modelKeys = Set(rope.parameters().flattened().map(\.0))
+
+        #expect(!modelKeys.contains("cosF32"))
+        #expect(!modelKeys.contains("sinF32"))
+        #expect(!modelKeys.contains("cosByDType"))
+        #expect(!modelKeys.contains("sinByDType"))
+
+        try rope.update(parameters: ModuleParameters.unflattened([:]), verify: .all)
     }
 }
 

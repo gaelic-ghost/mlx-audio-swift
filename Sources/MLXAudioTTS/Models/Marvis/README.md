@@ -32,3 +32,7 @@ let audio = try await model.generate(
     generationParameters: GenerateParameters()
 )
 ```
+
+## Maintainer Note
+
+Marvis uses runtime-built RoPE caches inside `CSMLlama3ScaledRoPE`. Those caches are derived at model initialization time and are not checkpoint weights, so they must stay hidden from MLX module parameter reflection. Keep those cache fields underscore-prefixed so strict checkpoint verification with `verify: .all` continues to validate real weights without demanding runtime-only cache keys such as `rope.cosF32`.
