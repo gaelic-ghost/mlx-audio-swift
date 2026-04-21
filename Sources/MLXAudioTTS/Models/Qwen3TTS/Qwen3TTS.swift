@@ -344,7 +344,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
     public func prepareReferenceConditioning(
         refAudio: MLXArray,
         refText: String,
-        language: String
+        language: String?
     ) throws -> Qwen3TTSReferenceConditioning {
         guard tokenizer != nil else {
             fatalError("Tokenizer not loaded")
@@ -358,7 +358,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let refEnd = max(refStart, refCount - 2)
         let refTextIds = refIds[0..., refStart ..< refEnd]
 
-        let resolvedLanguage = language.lowercased()
+        let resolvedLanguage = (language ?? "auto").lowercased()
         let codecLanguageID: Int?
         if resolvedLanguage != "auto", let langMap = config.talkerConfig?.codecLanguageId {
             codecLanguageID = langMap[resolvedLanguage]
@@ -396,6 +396,48 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             maxTokens: generationParameters.maxTokens ?? 4096,
             onGeneratedCodes: onGeneratedCodes
         )
+    }
+
+    public func generateStream(
+        text: String,
+        conditioning: Qwen3TTSReferenceConditioning,
+        generationParameters: GenerateParameters,
+        streamingInterval: Double
+    ) -> AsyncThrowingStream<AudioGeneration, Error> {
+        let (stream, continuation) = AsyncThrowingStream<AudioGeneration, Error>.makeStream()
+        Task { @Sendable [weak self] in
+            guard let self else { return }
+            do {
+                _ = generateVoiceDesign(
+                    text: text,
+                    instruct: nil,
+                    language: conditioning.resolvedLanguage,
+                    refAudio: nil,
+                    refText: nil,
+                    referenceConditioning: conditioning,
+                    temperature: generationParameters.temperature,
+                    topK: 50,
+                    topP: generationParameters.topP,
+                    repetitionPenalty: generationParameters.repetitionPenalty ?? 1.05,
+                    minP: 0.0,
+                    maxTokens: generationParameters.maxTokens ?? 4096,
+                    streamingInterval: streamingInterval,
+                    onToken: { tokenId in
+                        continuation.yield(.token(tokenId))
+                    },
+                    onInfo: { info in
+                        continuation.yield(.info(info))
+                    },
+                    onAudioChunk: { chunk in
+                        continuation.yield(.audio(chunk))
+                    }
+                )
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+        return stream
     }
 
     // MARK: - VoiceDesign generation
