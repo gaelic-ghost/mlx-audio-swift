@@ -27,6 +27,19 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
     public var sampleRate: Int { config.sampleRate }
 
+    struct DebugGeneratedCodes {
+        let generatedCodes: MLXArray
+        let referenceCodes: MLXArray?
+    }
+
+    struct Qwen3TTSReferenceConditioning {
+        let speakerEmbedding: MLXArray?
+        let referenceSpeechCodes: MLXArray
+        let referenceTextTokenIDs: MLXArray
+        let resolvedLanguage: String
+        let codecLanguageID: Int?
+    }
+
     public var defaultGenerationParameters: GenerateParameters {
         GenerateParameters(
             maxTokens: 4096,
@@ -188,6 +201,56 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         return audio
     }
 
+    func debugDecodeChunk(_ codes: MLXArray, chunkTokens: Int = 300) -> MLXArray {
+        decodeChunk(codes, chunkTokens: chunkTokens)
+    }
+
+    func debugStreamingDecode(
+        generatedCodes: MLXArray,
+        referenceCodes: MLXArray? = nil,
+        chunkTokens: Int = 300,
+        warmWithReferenceCodes: Bool = false
+    ) -> MLXArray {
+        guard let speechTokenizer else { return MLXArray.zeros([1]) }
+
+        let decoder = speechTokenizer.decoder
+        decoder.resetStreamingState()
+        defer { decoder.resetStreamingState() }
+
+        if warmWithReferenceCodes, let referenceCodes {
+            let warmup = referenceCodes.transposed(0, 2, 1)
+            var startIndex = 0
+            while startIndex < warmup.dim(1) {
+                let endIndex = min(startIndex + chunkTokens, warmup.dim(1))
+                let chunk = warmup[0..., startIndex ..< endIndex, 0...].transposed(0, 2, 1)
+                _ = decoder.streamingStep(chunk)
+                startIndex = endIndex
+            }
+        }
+
+        var chunks = [MLXArray]()
+        var startIndex = 0
+        while startIndex < generatedCodes.dim(1) {
+            let endIndex = min(startIndex + chunkTokens, generatedCodes.dim(1))
+            let chunk = generatedCodes[0..., startIndex ..< endIndex, 0...].transposed(0, 2, 1)
+            let wavChunk = decoder.streamingStep(chunk).squeezed(axis: 1)
+            eval(wavChunk)
+            chunks.append(wavChunk)
+            Memory.clearCache()
+            startIndex = endIndex
+        }
+
+        guard !chunks.isEmpty else { return MLXArray.zeros([1]) }
+        var audio = concatenated(chunks, axis: -1)[0]
+        let validLen = Int((generatedCodes[0..., 0..., 0] .> 0).sum().item(Int32.self))
+            * speechTokenizer.decodeUpsampleRate
+        if validLen > 0, validLen < audio.dim(0) {
+            audio = audio[..<validLen]
+        }
+        eval(audio)
+        return audio
+    }
+
     private func withInputPreparationCacheLock<T>(_ body: () -> T) -> T {
         inputPreparationCacheLock.lock()
         defer { inputPreparationCacheLock.unlock() }
@@ -259,6 +322,40 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         }
     }
 
+    func prepareReferenceConditioning(
+        refAudio: MLXArray,
+        refText: String,
+        language: String
+    ) -> Qwen3TTSReferenceConditioning {
+        guard tokenizer != nil else {
+            fatalError("Tokenizer not loaded")
+        }
+
+        let refContext = referenceAudioContext(for: refAudio)
+        let refChatText = "<|im_start|>assistant\n\(refText)<|im_end|>\n"
+        let refIds = MLXArray(tokenizer!.encode(text: refChatText).map { Int32($0) }).reshaped(1, -1)
+        let refCount = refIds.dim(1)
+        let refStart = min(3, refCount)
+        let refEnd = max(refStart, refCount - 2)
+        let refTextIds = refIds[0..., refStart ..< refEnd]
+
+        let resolvedLanguage = language.lowercased()
+        let codecLanguageID: Int?
+        if resolvedLanguage != "auto", let langMap = config.talkerConfig?.codecLanguageId {
+            codecLanguageID = langMap[resolvedLanguage]
+        } else {
+            codecLanguageID = nil
+        }
+
+        return Qwen3TTSReferenceConditioning(
+            speakerEmbedding: refContext.speakerEmbedding,
+            referenceSpeechCodes: refContext.refCodes,
+            referenceTextTokenIDs: refTextIds,
+            resolvedLanguage: resolvedLanguage,
+            codecLanguageID: codecLanguageID
+        )
+    }
+
     // MARK: - VoiceDesign generation
 
     func generateVoiceDesign(
@@ -267,6 +364,7 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         language: String,
         refAudio: MLXArray?,
         refText: String?,
+        referenceConditioning: Qwen3TTSReferenceConditioning? = nil,
         temperature: Float,
         topK: Int,
         topP: Float,
@@ -276,7 +374,8 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         streamingInterval: Double = 2.0,
         onToken: ((Int) -> Void)? = nil,
         onInfo: ((AudioGenerationInfo) -> Void)? = nil,
-        onAudioChunk: ((MLXArray) -> Void)? = nil
+        onAudioChunk: ((MLXArray) -> Void)? = nil,
+        onGeneratedCodes: ((DebugGeneratedCodes) -> Void)? = nil
     ) -> MLXArray {
         guard let speechTokenizer, let tokenizer else {
             return MLXArray.zeros([1])
@@ -290,7 +389,16 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         let ttsPadEmbed: MLXArray
         let refCodes: MLXArray?
 
-        if let refAudio,
+        if let referenceConditioning {
+            let prepared = prepareICLGenerationInputs(
+                text: text,
+                conditioning: referenceConditioning
+            )
+            inputEmbedsInit = prepared.0
+            trailingTextHidden = prepared.1
+            ttsPadEmbed = prepared.2
+            refCodes = prepared.3
+        } else if let refAudio,
            let refText,
            speechTokenizer.hasEncoder {
             let prepared = prepareICLGenerationInputs(
@@ -457,6 +565,9 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             return MLXArray.zeros([1])
         }
 
+        let codes = stacked(generatedCodes, axis: 1) // [1, seq_len, num_code_groups]
+        onGeneratedCodes?(DebugGeneratedCodes(generatedCodes: codes, referenceCodes: refCodes))
+
         // Emit generation info
         let generateTime = Date().timeIntervalSince(startTime)
         let tokenCount = generatedCodes.count
@@ -486,8 +597,6 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         }
 
         // Non-streaming path: full decode (existing behavior)
-        let codes = stacked(generatedCodes, axis: 1) // [1, seq_len, num_code_groups]
-
         var decodeCodes = codes
         if let refCodes {
             let refCodesT = refCodes.transposed(0, 2, 1)
@@ -613,6 +722,99 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         combinedPrefix = combinedPrefix + codecPrefixEmbed[0..., 0 ..< (codecPrefixEmbed.dim(1) - 1), 0...]
 
         // Full input embedding
+        let inputEmbeds = concatenated([roleEmbed, combinedPrefix, iclInputEmbed], axis: 1)
+
+        return (inputEmbeds, trailingTextHidden, ttsPadEmbed, refCodes)
+    }
+
+    func prepareICLGenerationInputs(
+        text: String,
+        conditioning: Qwen3TTSReferenceConditioning
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+        guard let tokenizer, let talkerConfig = config.talkerConfig else {
+            fatalError("Tokenizer/config not loaded")
+        }
+
+        let targetChatText = "<|im_start|>assistant\n\(text)<|im_end|>\n<|im_start|>assistant\n"
+        let targetIds = MLXArray(tokenizer.encode(text: targetChatText).map { Int32($0) }).reshaped(1, -1)
+        let targetCount = targetIds.dim(1)
+        let targetStart = min(3, targetCount)
+        let targetEnd = max(targetStart, targetCount - 5)
+        let targetTextIds = targetIds[0..., targetStart ..< targetEnd]
+
+        let ttsTokens = MLXArray(
+            [Int32(config.ttsBosTokenId), Int32(config.ttsEosTokenId), Int32(config.ttsPadTokenId)]
+        ).reshaped(1, 3)
+        let ttsEmbeds = talker.textProjection(talker.getTextEmbeddings()(ttsTokens))
+        let ttsBosEmbed = ttsEmbeds[0..., 0 ..< 1, 0...]
+        let ttsEosEmbed = ttsEmbeds[0..., 1 ..< 2, 0...]
+        let ttsPadEmbed = ttsEmbeds[0..., 2 ..< 3, 0...]
+
+        let refCodes = conditioning.referenceSpeechCodes
+        let firstCbCodes = refCodes[0..., 0, 0...]
+        var refCodecEmbed = talker.getInputEmbeddings()(firstCbCodes)
+        if talkerConfig.numCodeGroups > 1 {
+            for i in 0 ..< (talkerConfig.numCodeGroups - 1) {
+                let codeIdx = i + 1
+                if codeIdx >= refCodes.dim(1) { break }
+                let cbCodes = refCodes[0..., codeIdx, 0...]
+                refCodecEmbed = refCodecEmbed + talker.codePredictor.codecEmbedding[i](cbCodes)
+            }
+        }
+        let codecBosEmbed = talker.getInputEmbeddings()(
+            MLXArray([Int32(talkerConfig.codecBosId)]).reshaped(1, 1)
+        )
+        let codecEmbedIcl = concatenated([codecBosEmbed, refCodecEmbed], axis: 1)
+
+        let combinedTextIds = concatenated([conditioning.referenceTextTokenIDs, targetTextIds], axis: 1)
+        var textEmbed = talker.textProjection(talker.getTextEmbeddings()(combinedTextIds))
+        textEmbed = concatenated([textEmbed, ttsEosEmbed], axis: 1)
+        let textLen = textEmbed.dim(1)
+
+        let codecPadEmbed = talker.getInputEmbeddings()(MLXArray([Int32(talkerConfig.codecPadId)]).reshaped(1, 1))
+        let textWithCodecPad = textEmbed + broadcast(
+            codecPadEmbed,
+            to: [1, textLen, codecPadEmbed.dim(-1)]
+        )
+        let codecWithTextPad = codecEmbedIcl + broadcast(
+            ttsPadEmbed,
+            to: [1, codecEmbedIcl.dim(1), ttsPadEmbed.dim(-1)]
+        )
+
+        let iclInputEmbed = concatenated([textWithCodecPad, codecWithTextPad], axis: 1)
+        let trailingTextHidden = ttsPadEmbed
+
+        let codecPrefill: [Int32] = if let langId = conditioning.codecLanguageID {
+            [
+                Int32(talkerConfig.codecThinkId),
+                Int32(talkerConfig.codecThinkBosId),
+                Int32(langId),
+                Int32(talkerConfig.codecThinkEosId)
+            ]
+        } else {
+            [
+                Int32(talkerConfig.codecNothinkId),
+                Int32(talkerConfig.codecThinkBosId),
+                Int32(talkerConfig.codecThinkEosId)
+            ]
+        }
+
+        var codecPrefixEmbed = talker.getInputEmbeddings()(MLXArray(codecPrefill).reshaped(1, -1))
+        let codecPrefixSuffix = talker.getInputEmbeddings()(
+            MLXArray([Int32(talkerConfig.codecPadId), Int32(talkerConfig.codecBosId)]).reshaped(1, 2)
+        )
+        if let speakerEmbedding = conditioning.speakerEmbedding {
+            let speakerEmbed = speakerEmbedding.reshaped(1, 1, -1)
+            codecPrefixEmbed = concatenated([codecPrefixEmbed, speakerEmbed, codecPrefixSuffix], axis: 1)
+        } else {
+            codecPrefixEmbed = concatenated([codecPrefixEmbed, codecPrefixSuffix], axis: 1)
+        }
+
+        let roleEmbed = talker.textProjection(talker.getTextEmbeddings()(targetIds[0..., 0 ..< 3]))
+        let padCount = codecPrefixEmbed.dim(1) - 2
+        let padEmbeds = broadcast(ttsPadEmbed, to: [1, padCount, ttsPadEmbed.dim(-1)])
+        var combinedPrefix = concatenated([padEmbeds, ttsBosEmbed], axis: 1)
+        combinedPrefix = combinedPrefix + codecPrefixEmbed[0..., 0 ..< (codecPrefixEmbed.dim(1) - 1), 0...]
         let inputEmbeds = concatenated([roleEmbed, combinedPrefix, iclInputEmbed], axis: 1)
 
         return (inputEmbeds, trailingTextHidden, ttsPadEmbed, refCodes)

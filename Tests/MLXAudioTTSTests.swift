@@ -109,6 +109,205 @@ private func makeTinyFishSpeechConfig() -> FishSpeechConfig {
     )
 }
 
+private func makeDefaultQwen3TTSTokenizer() throws -> Qwen3TTSSpeechTokenizer {
+    let data = Data("{}".utf8)
+    let config = try JSONDecoder().decode(Qwen3TTSTokenizerConfig.self, from: data)
+    return Qwen3TTSSpeechTokenizer(config: config)
+}
+
+private func firstCachedQwen3TTSSnapshot() -> URL? {
+    let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+    let hub = home.appendingPathComponent(".cache/huggingface/hub", isDirectory: true)
+    let candidateRepos = [
+        "models--mlx-community--Qwen3-TTS-12Hz-0.6B-Base-4bit",
+        "models--mlx-community--Qwen3-TTS-12Hz-0.6B-Base-8bit",
+        "models--mlx-community--Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16",
+        "models--Qwen--Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+    ]
+
+    for repo in candidateRepos {
+        let snapshots = hub
+            .appendingPathComponent(repo, isDirectory: true)
+            .appendingPathComponent("snapshots", isDirectory: true)
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: snapshots,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            continue
+        }
+
+        if let snapshot = entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }).first {
+            return snapshot
+        }
+    }
+
+    return nil
+}
+
+private func cachedQwen3TTSSnapshot(repoID: String) -> URL? {
+    let home = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+    let hub = home.appendingPathComponent(".cache/huggingface/hub", isDirectory: true)
+    let repoDirectoryName = "models--" + repoID.replacingOccurrences(of: "/", with: "--")
+    let snapshots = hub
+        .appendingPathComponent(repoDirectoryName, isDirectory: true)
+        .appendingPathComponent("snapshots", isDirectory: true)
+
+    guard let entries = try? FileManager.default.contentsOfDirectory(
+        at: snapshots,
+        includingPropertiesForKeys: [.isDirectoryKey],
+        options: [.skipsHiddenFiles]
+    ) else {
+        return nil
+    }
+
+    return entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }).first
+}
+
+private func repeatedMonoAudio(_ audio: MLXArray, repeatCount: Int) -> MLXArray {
+    concatenated(Array(repeating: audio, count: max(repeatCount, 1)), axis: 0)
+}
+
+private func makeSyntheticQwen3CodecStream(
+    timeSteps: Int,
+    numQuantizers: Int,
+    codebookSize: Int
+) -> MLXArray {
+    var flatCodes = [Int32]()
+    flatCodes.reserveCapacity(timeSteps * numQuantizers)
+
+    for time in 0 ..< timeSteps {
+        for quantizer in 0 ..< numQuantizers {
+            let code = ((time * 37 + quantizer * 101) % max(codebookSize - 1, 1)) + 1
+            flatCodes.append(Int32(code))
+        }
+    }
+
+    return MLXArray(flatCodes).reshaped(1, timeSteps, numQuantizers)
+}
+
+private func rms(_ samples: ArraySlice<Float>) -> Double {
+    guard !samples.isEmpty else { return 0 }
+    let energy = samples.reduce(0.0) { partial, sample in
+        let value = Double(sample)
+        return partial + value * value
+    }
+    return Foundation.sqrt(energy / Double(samples.count))
+}
+
+private func quarterRMSProfile(_ samples: [Float]) -> (head: Double, tail: Double) {
+    guard !samples.isEmpty else { return (0, 0) }
+    let quarterLength = max(samples.count / 4, 1)
+    let head = rms(samples.prefix(quarterLength))
+    let tail = rms(samples.suffix(quarterLength))
+    return (head, tail)
+}
+
+private func trimDecodedReferencePrefix(
+    _ audio: MLXArray,
+    generatedCodes: MLXArray,
+    referenceCodes: MLXArray?
+) -> MLXArray {
+    guard let referenceCodes else { return audio }
+
+    let totalLen = generatedCodes.dim(1) + referenceCodes.dim(2)
+    let cut = Int(Double(referenceCodes.dim(2)) / Double(max(totalLen, 1)) * Double(audio.dim(0)))
+    guard cut > 0, cut < audio.dim(0) else { return audio }
+    return audio[cut...]
+}
+
+private struct PersistedQwenConditioningFloatTensor: Decodable {
+    let values: [Float]
+    let shape: [Int]
+
+    func makeArray() -> MLXArray {
+        MLXArray(values).reshaped(shape)
+    }
+}
+
+private struct PersistedQwenConditioningInt32Tensor: Decodable {
+    let values: [Int32]
+    let shape: [Int]
+
+    func makeArray() -> MLXArray {
+        MLXArray(values).reshaped(shape)
+    }
+}
+
+private struct PersistedQwenConditioningArtifact: Decodable {
+    let speakerEmbedding: PersistedQwenConditioningFloatTensor?
+    let referenceSpeechCodes: PersistedQwenConditioningInt32Tensor
+    let referenceTextTokenIDs: PersistedQwenConditioningInt32Tensor
+    let resolvedLanguage: String
+    let codecLanguageID: Int?
+
+    func makeConditioning() -> Qwen3TTSModel.Qwen3TTSReferenceConditioning {
+        Qwen3TTSModel.Qwen3TTSReferenceConditioning(
+            speakerEmbedding: speakerEmbedding?.makeArray(),
+            referenceSpeechCodes: referenceSpeechCodes.makeArray(),
+            referenceTextTokenIDs: referenceTextTokenIDs.makeArray(),
+            resolvedLanguage: resolvedLanguage,
+            codecLanguageID: codecLanguageID
+        )
+    }
+}
+
+private struct SpeakSwiftlyQwenProfileManifest: Decodable {
+    struct BackendMaterialization: Decodable {
+        let backend: String
+        let modelRepo: String
+        let referenceAudioFile: String?
+        let referenceText: String?
+    }
+
+    let modelRepo: String
+    let profileName: String
+    let sourceText: String?
+    let backendMaterializations: [BackendMaterialization]
+}
+
+private struct SpeakSwiftlyQwenProfileProbe {
+    let profile: SpeakSwiftlyQwenProfileManifest
+    let materialization: SpeakSwiftlyQwenProfileManifest.BackendMaterialization
+    let persistedConditioning: PersistedQwenConditioningArtifact?
+    let profileDirectory: URL
+}
+
+private func loadSpeakSwiftlyQwenProfileProbe(named profileName: String) throws -> SpeakSwiftlyQwenProfileProbe? {
+    let profileDirectory = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+        .appendingPathComponent("Library/Application Support/SpeakSwiftly/profiles/\(profileName)", isDirectory: true)
+    let profileURL = profileDirectory.appendingPathComponent("profile.json")
+    guard FileManager.default.fileExists(atPath: profileURL.path) else {
+        return nil
+    }
+
+    let decoder = JSONDecoder()
+    let profile = try decoder.decode(
+        SpeakSwiftlyQwenProfileManifest.self,
+        from: Data(contentsOf: profileURL)
+    )
+    guard let materialization = profile.backendMaterializations.first(where: { $0.backend == "qwen3" }) else {
+        return nil
+    }
+
+    let artifactURL = profileDirectory.appendingPathComponent("qwen-conditioning-qwen3.json")
+    let persistedConditioning: PersistedQwenConditioningArtifact? = if FileManager.default.fileExists(atPath: artifactURL.path) {
+        try decoder.decode(
+            PersistedQwenConditioningArtifact.self,
+            from: Data(contentsOf: artifactURL)
+        )
+    } else {
+        nil
+    }
+
+    return SpeakSwiftlyQwenProfileProbe(
+        profile: profile,
+        materialization: materialization,
+        persistedConditioning: persistedConditioning,
+        profileDirectory: profileDirectory
+    )
+}
+
 
 // MARK: - Text Cleaning Unit Tests
 
@@ -1325,4 +1524,481 @@ struct KokoroMultilingualProcessorTests {
         try await processor.prepare(for: "en-gb")
         try await processor.prepare(for: "en")
     }
+}
+
+struct Qwen3TTSDecodeRegressionTests {
+
+    @Test func streamingDecodeTailDoesNotCollapseRelativeToBoundedDecode() throws {
+        guard metalAvailable else { return }
+
+        let tokenizer = try makeDefaultQwen3TTSTokenizer()
+        let decoderConfig: Qwen3TTSTokenizerDecoderConfig
+        if let existingConfig = tokenizer.config.decoderConfig {
+            decoderConfig = existingConfig
+        } else {
+            decoderConfig = try JSONDecoder().decode(
+                Qwen3TTSTokenizerDecoderConfig.self,
+                from: Data("{}".utf8)
+            )
+        }
+        let codes = makeSyntheticQwen3CodecStream(
+            timeSteps: 3600,
+            numQuantizers: decoderConfig.numQuantizers,
+            codebookSize: decoderConfig.codebookSize
+        )
+
+        let (boundedAudio, _) = tokenizer.decode(codes)
+        let streamingChunks = tokenizer.streamingDecode(codes, chunkTokens: 300)
+        let streamingAudio = concatenated(streamingChunks, axis: -1)
+
+        let boundedProfile = quarterRMSProfile(boundedAudio.asArray(Float.self))
+        let streamingProfile = quarterRMSProfile(streamingAudio.asArray(Float.self))
+
+        #expect(
+            boundedProfile.head > 1e-6 && boundedProfile.tail > 1e-6,
+            "Synthetic Qwen3-TTS decode unexpectedly produced near-silent bounded audio; the regression fixture no longer exercises the decoder meaningfully."
+        )
+
+        let headGain = streamingProfile.head / boundedProfile.head
+        let tailGain = streamingProfile.tail / boundedProfile.tail
+
+        print(
+            """
+            bounded head rms: \(boundedProfile.head)
+            bounded tail rms: \(boundedProfile.tail)
+            streaming head rms: \(streamingProfile.head)
+            streaming tail rms: \(streamingProfile.tail)
+            head gain: \(headGain)
+            tail gain: \(tailGain)
+            """
+        )
+
+        #expect(
+            tailGain >= headGain * 0.8,
+            """
+            Qwen3-TTS incremental decode attenuated the tail much more than the bounded decode path.
+            bounded head rms: \(boundedProfile.head)
+            bounded tail rms: \(boundedProfile.tail)
+            streaming head rms: \(streamingProfile.head)
+            streaming tail rms: \(streamingProfile.tail)
+            head gain: \(headGain)
+            tail gain: \(tailGain)
+            """
+        )
+    }
+
+    @Test func cachedEncodedSpeechTailDoesNotCollapseRelativeToBoundedDecode() async throws {
+        guard metalAvailable else { return }
+        guard let modelDir = firstCachedQwen3TTSSnapshot() else {
+            print("Skipping cached Qwen3-TTS decode regression. No local Qwen3-TTS snapshot was found in ~/.cache/huggingface/hub.")
+            return
+        }
+
+        let model = try await Qwen3TTSModel.fromModelDirectory(modelDir)
+        guard let speechTokenizer = model.speechTokenizer else {
+            Issue.record("Cached Qwen3-TTS model loaded without a speech tokenizer.")
+            return
+        }
+        guard speechTokenizer.hasEncoder else {
+            Issue.record("Cached Qwen3-TTS speech tokenizer does not include an encoder, so the repro cannot derive real codec codes from fixture audio.")
+            return
+        }
+
+        let fixture = try loadTTSNetworkFixture(sampleRate: model.sampleRate, maxSamples: model.sampleRate * 30)
+        let repeatedFixture = repeatedMonoAudio(fixture, repeatCount: 12)
+        let encoderInput = repeatedFixture.reshaped(1, 1, repeatedFixture.dim(0))
+        let encodedCodes = speechTokenizer.encode(encoderInput)
+        let audioCodes = encodedCodes.transposed(0, 2, 1)
+
+        let (boundedAudio, _) = speechTokenizer.decode(audioCodes)
+        let streamingChunks = speechTokenizer.streamingDecode(audioCodes, chunkTokens: 300)
+        let streamingAudio = concatenated(streamingChunks, axis: -1)
+
+        let boundedProfile = quarterRMSProfile(boundedAudio.asArray(Float.self))
+        let streamingProfile = quarterRMSProfile(streamingAudio.asArray(Float.self))
+
+        #expect(
+            boundedProfile.head > 1e-5 && boundedProfile.tail > 1e-5,
+            "Cached Qwen3-TTS repro fixture decoded to near-silent bounded audio, so the regression is not exercising the tokenizer meaningfully."
+        )
+
+        let headGain = streamingProfile.head / boundedProfile.head
+        let tailGain = streamingProfile.tail / boundedProfile.tail
+        let encodedTokens = audioCodes.dim(1)
+
+        print(
+            """
+            cached model dir: \(modelDir.path)
+            encoded token count: \(encodedTokens)
+            bounded head rms: \(boundedProfile.head)
+            bounded tail rms: \(boundedProfile.tail)
+            streaming head rms: \(streamingProfile.head)
+            streaming tail rms: \(streamingProfile.tail)
+            head gain: \(headGain)
+            tail gain: \(tailGain)
+            """
+        )
+
+        #expect(
+            tailGain >= headGain * 0.8,
+            """
+            Qwen3-TTS streaming decode attenuated the tail much more than the bounded decode path on real encoder-produced codes.
+            cached model dir: \(modelDir.path)
+            encoded token count: \(encodedTokens)
+            bounded head rms: \(boundedProfile.head)
+            bounded tail rms: \(boundedProfile.tail)
+            streaming head rms: \(streamingProfile.head)
+            streaming tail rms: \(streamingProfile.tail)
+            head gain: \(headGain)
+            tail gain: \(tailGain)
+            """
+        )
+    }
+
+    @Test func conditionedGeneratedCodesStayLevelAcrossDecodePaths() async throws {
+        guard metalAvailable else { return }
+        guard let modelDir = firstCachedQwen3TTSSnapshot() else {
+            print("Skipping conditioned Qwen3-TTS decode comparison. No local Qwen3-TTS snapshot was found in ~/.cache/huggingface/hub.")
+            return
+        }
+
+        let model = try await Qwen3TTSModel.fromModelDirectory(modelDir)
+        guard let speechTokenizer = model.speechTokenizer else {
+            Issue.record("Cached Qwen3-TTS model loaded without a speech tokenizer.")
+            return
+        }
+
+        let refAudio = try loadTTSNetworkFixture(sampleRate: model.sampleRate, maxSamples: model.sampleRate * 8)
+        let text = Array(
+            repeating: "This is a conditioned long-form Qwen3 decode comparison for late utterance loudness stability.",
+            count: 6
+        ).joined(separator: " ")
+        let refText = "This is a short reference utterance for the conditioned decode-path comparison."
+
+        var captured: Qwen3TTSModel.DebugGeneratedCodes?
+        _ = model.generateVoiceDesign(
+            text: text,
+            instruct: nil,
+            language: "en",
+            refAudio: refAudio,
+            refText: refText,
+            temperature: 0.6,
+            topK: 50,
+            topP: 0.8,
+            repetitionPenalty: 1.05,
+            minP: 0.0,
+            maxTokens: 220,
+            onGeneratedCodes: { debug in
+                captured = debug
+            }
+        )
+
+        guard let captured else {
+            Issue.record("Conditioned Qwen3-TTS generation finished without exposing generated codec codes for decode comparison.")
+            return
+        }
+
+        let generatedCodes = captured.generatedCodes
+        let decodeCodes: MLXArray
+        if let referenceCodes = captured.referenceCodes {
+            decodeCodes = concatenated([referenceCodes.transposed(0, 2, 1), generatedCodes], axis: 1)
+        } else {
+            decodeCodes = generatedCodes
+        }
+
+        let helperDecoded = trimDecodedReferencePrefix(
+            model.debugDecodeChunk(decodeCodes),
+            generatedCodes: generatedCodes,
+            referenceCodes: captured.referenceCodes
+        )
+        let boundedDecoded = trimDecodedReferencePrefix(
+            speechTokenizer.decode(decodeCodes).0,
+            generatedCodes: generatedCodes,
+            referenceCodes: captured.referenceCodes
+        )
+        let warmedStreamingDecoded = model.debugStreamingDecode(
+            generatedCodes: generatedCodes,
+            referenceCodes: captured.referenceCodes,
+            chunkTokens: 300,
+            warmWithReferenceCodes: true
+        )
+
+        let helperProfile = quarterRMSProfile(helperDecoded.asArray(Float.self))
+        let boundedProfile = quarterRMSProfile(boundedDecoded.asArray(Float.self))
+        let warmedProfile = quarterRMSProfile(warmedStreamingDecoded.asArray(Float.self))
+
+        #expect(
+            boundedProfile.head > 1e-5 && boundedProfile.tail > 1e-5,
+            "Conditioned Qwen3 decode comparison produced near-silent bounded audio, so the generated-code fixture is not meaningful."
+        )
+
+        let helperHeadGain = helperProfile.head / boundedProfile.head
+        let helperTailGain = helperProfile.tail / boundedProfile.tail
+        let warmedHeadGain = warmedProfile.head / boundedProfile.head
+        let warmedTailGain = warmedProfile.tail / boundedProfile.tail
+
+        print(
+            """
+            conditioned model dir: \(modelDir.path)
+            generated token count: \(generatedCodes.dim(1))
+            reference token count: \(captured.referenceCodes?.dim(2) ?? 0)
+            helper head rms: \(helperProfile.head)
+            helper tail rms: \(helperProfile.tail)
+            bounded head rms: \(boundedProfile.head)
+            bounded tail rms: \(boundedProfile.tail)
+            warmed streaming head rms: \(warmedProfile.head)
+            warmed streaming tail rms: \(warmedProfile.tail)
+            helper head gain: \(helperHeadGain)
+            helper tail gain: \(helperTailGain)
+            warmed head gain: \(warmedHeadGain)
+            warmed tail gain: \(warmedTailGain)
+            """
+        )
+
+        #expect(
+            helperTailGain >= helperHeadGain * 0.8,
+            """
+            The current Qwen3 decodeChunk path attenuated the tail much more than bounded decode on the same conditioned generated code sequence.
+            helper head gain: \(helperHeadGain)
+            helper tail gain: \(helperTailGain)
+            """
+        )
+
+        #expect(
+            warmedTailGain >= warmedHeadGain * 0.8,
+            """
+            Reference-warmed streaming decode attenuated the tail much more than bounded decode on the same conditioned generated code sequence.
+            warmed head gain: \(warmedHeadGain)
+            warmed tail gain: \(warmedTailGain)
+            """
+        )
+    }
+
+    @Test func speakSwiftlyConditioningArtifactProbeCapturesProfileDecay() async throws {
+        guard metalAvailable else { return }
+
+        let profileDirectory = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent("Library/Application Support/SpeakSwiftly/profiles/probe-clear-masc-20260421", isDirectory: true)
+        let profileURL = profileDirectory.appendingPathComponent("profile.json")
+        let artifactURL = profileDirectory.appendingPathComponent("qwen-conditioning-qwen3.json")
+
+        guard FileManager.default.fileExists(atPath: profileURL.path),
+              FileManager.default.fileExists(atPath: artifactURL.path) else {
+            print("Skipping SpeakSwiftly artifact probe. The local probe-clear-masc-20260421 profile artifacts are not present.")
+            return
+        }
+
+        let decoder = JSONDecoder()
+        let profile = try decoder.decode(
+            SpeakSwiftlyQwenProfileManifest.self,
+            from: Data(contentsOf: profileURL)
+        )
+        guard let materialization = profile.backendMaterializations.first(where: { $0.backend == "qwen3" }) else {
+            Issue.record("The SpeakSwiftly probe-clear-masc-20260421 profile does not include a qwen3 backend materialization.")
+            return
+        }
+
+        guard let modelDir = cachedQwen3TTSSnapshot(repoID: materialization.modelRepo) else {
+            print("Skipping SpeakSwiftly artifact probe. No local cached snapshot was found for \(materialization.modelRepo).")
+            return
+        }
+
+        let model = try await Qwen3TTSModel.fromModelDirectory(modelDir)
+        let artifact = try decoder.decode(
+            PersistedQwenConditioningArtifact.self,
+            from: Data(contentsOf: artifactURL)
+        )
+        let persistedConditioning = artifact.makeConditioning()
+
+        let referenceAudioFile = materialization.referenceAudioFile ?? "reference.wav"
+        let referenceAudioURL = profileDirectory.appendingPathComponent(referenceAudioFile)
+        let (_, referenceAudio) = try loadAudioArray(from: referenceAudioURL, sampleRate: model.sampleRate)
+        let referenceText = materialization.referenceText ?? profile.sourceText ?? "Hello there from SpeakSwiftly end-to-end coverage."
+        let longText = Array(
+            repeating: "SpeakSwiftly artifact-conditioned Qwen long-form coverage is probing for severe late-utterance volume decay across a long retained sample.",
+            count: 14
+        ).joined(separator: " ")
+
+        var rawCapture: Qwen3TTSModel.DebugGeneratedCodes?
+        let rawAudio = model.generateVoiceDesign(
+            text: longText,
+            instruct: nil,
+            language: "english",
+            refAudio: referenceAudio,
+            refText: referenceText,
+            temperature: 0.6,
+            topK: 50,
+            topP: 0.8,
+            repetitionPenalty: 1.05,
+            minP: 0.0,
+            maxTokens: 420,
+            onGeneratedCodes: { debug in
+                rawCapture = debug
+            }
+        )
+
+        var artifactCapture: Qwen3TTSModel.DebugGeneratedCodes?
+        let artifactAudio = model.generateVoiceDesign(
+            text: longText,
+            instruct: nil,
+            language: persistedConditioning.resolvedLanguage,
+            refAudio: nil,
+            refText: nil,
+            referenceConditioning: persistedConditioning,
+            temperature: 0.6,
+            topK: 50,
+            topP: 0.8,
+            repetitionPenalty: 1.05,
+            minP: 0.0,
+            maxTokens: 420,
+            onGeneratedCodes: { debug in
+                artifactCapture = debug
+            }
+        )
+
+        guard let rawCapture, let artifactCapture else {
+            Issue.record("The SpeakSwiftly artifact probe generation finished without exposing generated codec codes.")
+            return
+        }
+
+        let rawProfile = quarterRMSProfile(rawAudio.asArray(Float.self))
+        let artifactProfile = quarterRMSProfile(artifactAudio.asArray(Float.self))
+        let rawTailRatio = rawProfile.tail / rawProfile.head
+        let artifactTailRatio = artifactProfile.tail / artifactProfile.head
+
+        let artifactDecodeCodes = if let referenceCodes = artifactCapture.referenceCodes {
+            concatenated([referenceCodes.transposed(0, 2, 1), artifactCapture.generatedCodes], axis: 1)
+        } else {
+            artifactCapture.generatedCodes
+        }
+        let artifactHelperDecoded = trimDecodedReferencePrefix(
+            model.debugDecodeChunk(artifactDecodeCodes),
+            generatedCodes: artifactCapture.generatedCodes,
+            referenceCodes: artifactCapture.referenceCodes
+        )
+        let artifactBoundedDecoded = trimDecodedReferencePrefix(
+            model.speechTokenizer!.decode(artifactDecodeCodes).0,
+            generatedCodes: artifactCapture.generatedCodes,
+            referenceCodes: artifactCapture.referenceCodes
+        )
+        let artifactHelperProfile = quarterRMSProfile(artifactHelperDecoded.asArray(Float.self))
+        let artifactBoundedProfile = quarterRMSProfile(artifactBoundedDecoded.asArray(Float.self))
+        let artifactHelperHeadGain = artifactHelperProfile.head / artifactBoundedProfile.head
+        let artifactHelperTailGain = artifactHelperProfile.tail / artifactBoundedProfile.tail
+
+        print(
+            """
+            SpeakSwiftly profile: \(profile.profileName)
+            model dir: \(modelDir.path)
+            raw generated token count: \(rawCapture.generatedCodes.dim(1))
+            artifact generated token count: \(artifactCapture.generatedCodes.dim(1))
+            raw head rms: \(rawProfile.head)
+            raw tail rms: \(rawProfile.tail)
+            raw tail ratio: \(rawTailRatio)
+            artifact head rms: \(artifactProfile.head)
+            artifact tail rms: \(artifactProfile.tail)
+            artifact tail ratio: \(artifactTailRatio)
+            artifact helper head gain: \(artifactHelperHeadGain)
+            artifact helper tail gain: \(artifactHelperTailGain)
+            """
+        )
+
+        #expect(
+            rawProfile.head > 1e-5 && artifactProfile.head > 1e-5,
+            "The SpeakSwiftly artifact probe produced near-silent head audio, so the retained-output RMS comparison is not meaningful."
+        )
+    }
+
+    @Test func speakSwiftlyProfileMatrixLogsArtifactAndLengthSensitivity() async throws {
+        guard metalAvailable else { return }
+
+        let profileNames = [
+            "probe-soft-femme-20260421",
+            "probe-clear-masc-20260421",
+        ]
+        let shortText = "This shorter artifact-conditioning probe checks whether late utterance loudness stays stable."
+        let longText = Array(
+            repeating: "This longer artifact-conditioning probe is intentionally stretching the utterance so we can measure how much late retained loudness falls off as sequence length grows for the same profile.",
+            count: 10
+        ).joined(separator: " ")
+
+        for profileName in profileNames {
+            guard let probe = try loadSpeakSwiftlyQwenProfileProbe(named: profileName) else {
+                print("Skipping profile matrix entry for \(profileName). The local SpeakSwiftly profile or qwen3 materialization is unavailable.")
+                continue
+            }
+            guard let persistedConditioning = probe.persistedConditioning?.makeConditioning() else {
+                print("Skipping profile matrix artifact comparison for \(profileName). No persisted qwen-conditioning-qwen3.json artifact was found.")
+                continue
+            }
+            guard let modelDir = cachedQwen3TTSSnapshot(repoID: probe.materialization.modelRepo) else {
+                print("Skipping profile matrix entry for \(profileName). No local cached snapshot was found for \(probe.materialization.modelRepo).")
+                continue
+            }
+
+            let model = try await Qwen3TTSModel.fromModelDirectory(modelDir)
+            let referenceAudioFile = probe.materialization.referenceAudioFile ?? "reference.wav"
+            let referenceAudioURL = probe.profileDirectory.appendingPathComponent(referenceAudioFile)
+            let (_, referenceAudio) = try loadAudioArray(from: referenceAudioURL, sampleRate: model.sampleRate)
+            let referenceText = probe.materialization.referenceText ?? probe.profile.sourceText ?? "Hello there from SpeakSwiftly end-to-end coverage."
+
+            for (label, text, maxTokens) in [
+                ("short", shortText, 180),
+                ("long", longText, 360),
+            ] {
+                let rawAudio = model.generateVoiceDesign(
+                    text: text,
+                    instruct: nil,
+                    language: "english",
+                    refAudio: referenceAudio,
+                    refText: referenceText,
+                    temperature: 0.6,
+                    topK: 50,
+                    topP: 0.8,
+                    repetitionPenalty: 1.05,
+                    minP: 0.0,
+                    maxTokens: maxTokens
+                )
+                let artifactAudio = model.generateVoiceDesign(
+                    text: text,
+                    instruct: nil,
+                    language: persistedConditioning.resolvedLanguage,
+                    refAudio: nil,
+                    refText: nil,
+                    referenceConditioning: persistedConditioning,
+                    temperature: 0.6,
+                    topK: 50,
+                    topP: 0.8,
+                    repetitionPenalty: 1.05,
+                    minP: 0.0,
+                    maxTokens: maxTokens
+                )
+
+                let rawProfile = quarterRMSProfile(rawAudio.asArray(Float.self))
+                let artifactProfile = quarterRMSProfile(artifactAudio.asArray(Float.self))
+                let rawTailRatio = rawProfile.tail / rawProfile.head
+                let artifactTailRatio = artifactProfile.tail / artifactProfile.head
+
+                print(
+                    """
+                    profile matrix entry: \(profileName) [\(label)]
+                    model dir: \(modelDir.path)
+                    raw head rms: \(rawProfile.head)
+                    raw tail rms: \(rawProfile.tail)
+                    raw tail ratio: \(rawTailRatio)
+                    artifact head rms: \(artifactProfile.head)
+                    artifact tail rms: \(artifactProfile.tail)
+                    artifact tail ratio: \(artifactTailRatio)
+                    """
+                )
+
+                #expect(
+                    rawProfile.head > 1e-5 && artifactProfile.head > 1e-5,
+                    "The SpeakSwiftly profile matrix probe produced near-silent head audio for \(profileName) [\(label)], so the retained-output comparison is not meaningful."
+                )
+
+            }
+        }
+    }
+
 }
