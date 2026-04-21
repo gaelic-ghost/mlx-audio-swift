@@ -224,6 +224,20 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         decodeChunk(codes, chunkTokens: chunkTokens)
     }
 
+    public func debugBoundedDecode(_ codes: MLXArray) -> MLXArray {
+        guard let speechTokenizer else { return MLXArray.zeros([1]) }
+
+        var audio = speechTokenizer.decode(codes).0
+        let validLen = Int((codes[0..., 0..., 0] .> 0).sum().item(Int32.self))
+            * speechTokenizer.decodeUpsampleRate
+        if validLen > 0, validLen < audio.dim(0) {
+            audio = audio[..<validLen]
+        }
+
+        eval(audio)
+        return audio
+    }
+
     public func debugStreamingDecode(
         generatedCodes: MLXArray,
         referenceCodes: MLXArray? = nil,
