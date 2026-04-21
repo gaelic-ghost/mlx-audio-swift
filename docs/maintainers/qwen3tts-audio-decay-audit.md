@@ -291,6 +291,24 @@ So the strongest honest reading is now:
 - the matrix is currently best treated as an investigation harness and logging
   surface, not a strict pass/fail regression test
 
+### Follow-up on the downstream SpeakSwiftly harness
+
+The local SpeakSwiftly checkout has since tightened the Qwen probe harness in a
+few ways that make its future reports more trustworthy:
+
+- `volume-probe` now validates explicit `--conditioning artifact` runs up front
+  instead of silently falling back to rebuilt conditioning when no stored
+  artifact is present
+- the new quarter-style `head_rms`, `tail_rms`, and `tail_head_ratio` summary
+  values are now computed with duration-weighted RMS instead of a plain average
+  of per-window RMS
+- the harness now writes structured JSON artifacts under
+  `.local/volume-probes/` for both `compare-volume` and `matrix-volume`
+
+That does not remove the stochastic behavior seen across reruns, but it does
+mean newer SpeakSwiftly probe reports are less likely to be mislabeled and the
+head/tail comparison metrics are now a better fit for upstream cross-checking.
+
 ### Updated significance
 
 At this point the evidence stack looks like this:
