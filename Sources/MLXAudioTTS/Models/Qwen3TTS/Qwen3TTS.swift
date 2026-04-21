@@ -27,17 +27,36 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
 
     public var sampleRate: Int { config.sampleRate }
 
-    struct DebugGeneratedCodes {
-        let generatedCodes: MLXArray
-        let referenceCodes: MLXArray?
+    public struct DebugGeneratedCodes {
+        public let generatedCodes: MLXArray
+        public let referenceCodes: MLXArray?
+
+        public init(generatedCodes: MLXArray, referenceCodes: MLXArray?) {
+            self.generatedCodes = generatedCodes
+            self.referenceCodes = referenceCodes
+        }
     }
 
-    struct Qwen3TTSReferenceConditioning {
-        let speakerEmbedding: MLXArray?
-        let referenceSpeechCodes: MLXArray
-        let referenceTextTokenIDs: MLXArray
-        let resolvedLanguage: String
-        let codecLanguageID: Int?
+    public struct Qwen3TTSReferenceConditioning {
+        public let speakerEmbedding: MLXArray?
+        public let referenceSpeechCodes: MLXArray
+        public let referenceTextTokenIDs: MLXArray
+        public let resolvedLanguage: String
+        public let codecLanguageID: Int?
+
+        public init(
+            speakerEmbedding: MLXArray?,
+            referenceSpeechCodes: MLXArray,
+            referenceTextTokenIDs: MLXArray,
+            resolvedLanguage: String,
+            codecLanguageID: Int?
+        ) {
+            self.speakerEmbedding = speakerEmbedding
+            self.referenceSpeechCodes = referenceSpeechCodes
+            self.referenceTextTokenIDs = referenceTextTokenIDs
+            self.resolvedLanguage = resolvedLanguage
+            self.codecLanguageID = codecLanguageID
+        }
     }
 
     public var defaultGenerationParameters: GenerateParameters {
@@ -201,11 +220,11 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         return audio
     }
 
-    func debugDecodeChunk(_ codes: MLXArray, chunkTokens: Int = 300) -> MLXArray {
+    public func debugDecodeChunk(_ codes: MLXArray, chunkTokens: Int = 300) -> MLXArray {
         decodeChunk(codes, chunkTokens: chunkTokens)
     }
 
-    func debugStreamingDecode(
+    public func debugStreamingDecode(
         generatedCodes: MLXArray,
         referenceCodes: MLXArray? = nil,
         chunkTokens: Int = 300,
@@ -322,11 +341,11 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
         }
     }
 
-    func prepareReferenceConditioning(
+    public func prepareReferenceConditioning(
         refAudio: MLXArray,
         refText: String,
         language: String
-    ) -> Qwen3TTSReferenceConditioning {
+    ) throws -> Qwen3TTSReferenceConditioning {
         guard tokenizer != nil else {
             fatalError("Tokenizer not loaded")
         }
@@ -353,6 +372,29 @@ public final class Qwen3TTSModel: Module, SpeechGenerationModel, @unchecked Send
             referenceTextTokenIDs: refTextIds,
             resolvedLanguage: resolvedLanguage,
             codecLanguageID: codecLanguageID
+        )
+    }
+
+    public func generate(
+        text: String,
+        conditioning: Qwen3TTSReferenceConditioning,
+        generationParameters: GenerateParameters,
+        onGeneratedCodes: ((DebugGeneratedCodes) -> Void)? = nil
+    ) async throws -> MLXArray {
+        generateVoiceDesign(
+            text: text,
+            instruct: nil,
+            language: conditioning.resolvedLanguage,
+            refAudio: nil,
+            refText: nil,
+            referenceConditioning: conditioning,
+            temperature: generationParameters.temperature,
+            topK: 50,
+            topP: generationParameters.topP,
+            repetitionPenalty: generationParameters.repetitionPenalty ?? 1.05,
+            minP: 0.0,
+            maxTokens: generationParameters.maxTokens ?? 4096,
+            onGeneratedCodes: onGeneratedCodes
         )
     }
 
